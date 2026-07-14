@@ -1,0 +1,318 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+
+layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
+layout(binding = 1, set = 0, rgba8)   uniform image2D outImage;
+layout(binding = 2, set = 0) uniform CameraProperties {
+    mat4 viewInverse;
+    mat4 projInverse;
+    vec4 lightPos;   // xyz = position, w = radius (area light)
+    vec4 params;     // x = time, y = maxBounces, z = light emission strength, w = samples per frame
+    uvec4 frame;     // x = accumulated frame index (0 on camera move / scene edit)
+    vec4 marquee;    // rubber-band rect in pixels (x0,y0,x1,y1); x1 < x0 disables
+} cam;
+layout(binding = 5, set = 0, rgba32f) uniform image2D accumImage;
+layout(binding = 6, set = 0, rgba32f) uniform image2D histImage; // xyz = prev primary-hit world pos
+
+struct HitPayload {
+    vec3  hitPos;
+    vec3  normal;       // faces against the incoming ray
+    vec3  albedo;
+    float reflectivity;
+    float matId;        // 0 = floor, 1 = solid, 2 = glass, 3 = emissive light
+    float t;            // < 0 means miss
+    float frontFace;    // 1 = ray hit the outer surface, 0 = inside
+    float selected;     // 1 = this object is selected in the editor
+};
+
+layout(location = 0) rayPayloadEXT HitPayload payload;
+layout(location = 1) rayPayloadEXT float      shadowed;
+
+// Per-channel IOR for chromatic dispersion (exaggerated for visibility).
+const float IOR_R = 1.50, IOR_G = 1.52, IOR_B = 1.54;
+
+// ---------------------------------------------------------------------------
+//  PCG random number generator
+// ---------------------------------------------------------------------------
+uint pcg(inout uint state) {
+    state = state * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+float rnd(inout uint state) { return float(pcg(state)) * (1.0 / 4294967296.0); }
+
+// ---------------------------------------------------------------------------
+//  Helpers
+// ---------------------------------------------------------------------------
+vec3 skyColor(vec3 d) {
+    // Same palette as the path-traced version, so side-by-side comparisons
+    // show algorithmic differences (GI, caustics) rather than tonal ones.
+    float h = 0.5 * (normalize(d).y + 1.0);
+    return mix(vec3(0.42, 0.50, 0.62), vec3(0.10, 0.20, 0.45), h);
+}
+// Box-filtered checkerboard (iq). w = filter width in world units, i.e. how
+// much of the plane one pixel covers at this hit. At w -> 0 this equals the
+// old hard checker; at large w it converges to the mean grey, which is what
+// kills the moire on the floor and in its reflections.
+vec3 checker(vec3 p, float w) {
+    vec2 uv = p.xz;
+    vec2 fw = vec2(max(w, 1e-4));
+    vec2 i = 2.0 * (abs(fract((uv - 0.5 * fw) * 0.5) - 0.5)
+                  - abs(fract((uv + 0.5 * fw) * 0.5) - 0.5)) / fw;
+    float f = 0.5 - 0.5 * i.x * i.y;              // 0 = light cell, 1 = dark
+    return mix(vec3(0.85), vec3(0.10), f);
+}
+void basis(vec3 n, out vec3 t, out vec3 b) {
+    vec3 a = abs(n.x) > 0.9 ? vec3(0, 1, 0) : vec3(1, 0, 0);
+    t = normalize(cross(n, a));
+    b = cross(n, t);
+}
+// Random direction inside a cone of half-angle acos(cosThetaMax) around dir.
+vec3 sampleCone(vec3 dir, float cosThetaMax, float u1, float u2) {
+    float cosT = mix(1.0, cosThetaMax, u1);
+    float sinT = sqrt(max(0.0, 1.0 - cosT * cosT));
+    float phi  = 6.28318530718 * u2;
+    vec3 t, b; basis(dir, t, b);
+    return normalize(t * (cos(phi) * sinT) + b * (sin(phi) * sinT) + dir * cosT);
+}
+float traceShadow(vec3 origin, vec3 L, float tmax) {
+    shadowed = 1.0;
+    traceRayEXT(topLevelAS,
+        gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+        0xFF, 0, 0, 1, origin, 0.001, L, tmax, 1);
+    return shadowed;
+}
+
+// ---------------------------------------------------------------------------
+//  Trace one full path for one (jittered) sample.
+// ---------------------------------------------------------------------------
+vec3 renderSample(inout uint seed, int sampleIdx, int spp) {
+    vec2 jitter = vec2(rnd(seed), rnd(seed)) - 0.5;
+    vec2 pixel  = vec2(gl_LaunchIDEXT.xy) + 0.5 + jitter;
+    vec2 inUV   = pixel / vec2(gl_LaunchSizeEXT.xy);
+    vec2 d      = inUV * 2.0 - 1.0;
+
+    vec3 origin = (cam.viewInverse * vec4(0, 0, 0, 1)).xyz;
+    vec4 target = cam.projInverse * vec4(d.x, d.y, 1, 1);
+    vec3 dir    = normalize((cam.viewInverse * vec4(normalize(target.xyz), 0)).xyz);
+
+    int   maxBounces = int(cam.params.y);
+    float emission   = cam.params.z;    // radiance scale of the area light (shared with the PT view)
+    const float eps  = 0.001;
+
+    vec3 color      = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+
+    // Spectral channel is fixed per sample (stratified), so over a frame each
+    // R/G/B channel gets an equal share -> dispersion with no channel noise.
+    int  hero      = sampleIdx % 3;     // 0 = R, 1 = G, 2 = B
+    bool dispersed = false;
+
+    // Stratified Fresnel decision for the FIRST glass hit of the path: sample s
+    // covers stratum (s/3) out of (spp/3), so the reflect/refract split is close
+    // to exact within a single frame instead of relying on accumulation.
+    int   strata    = max(spp / 3, 1);
+    float fresU     = (float(sampleIdx / 3) + rnd(seed)) / float(strata);
+    bool  fresFresh = true;
+
+    // Angular size of one pixel (radians). abs() because perspectiveVk bakes in
+    // the Vulkan Y flip, so projInverse[1][1] can be negative. Used to size the
+    // checker filter footprint; grows with accumulated path length, so the
+    // floor is filtered correctly in reflections too.
+    float pixSpread = 2.0 * abs(cam.projInverse[1][1]) / float(gl_LaunchSizeEXT.y);
+    float pathLen   = 0.0;
+
+    int bounce;
+    for (bounce = 0; bounce <= maxBounces; ++bounce) {
+        payload.t = 0.0;
+        traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, 0, 0, 0,
+                    origin, 0.001, dir, 10000.0, 0);
+
+        if (payload.t < 0.0) { color += throughput * skyColor(dir); break; }
+
+        pathLen += payload.t;
+        vec3 N   = normalize(payload.normal);
+        int  mat = int(payload.matId + 0.5);
+
+        // ---- Editor selection: warm rim highlight on the primary hit --------
+        if (bounce == 0 && payload.selected > 0.5) {
+            float cosI = clamp(dot(-dir, N), 0.0, 1.0);
+            float rim  = pow(1.0 - cosI, 3.0);
+            color += vec3(1.0, 0.62, 0.15) * (0.06 + 0.9 * rim) * 0.7;
+        }
+
+        // ---- Emissive area light: see the source directly ------------------
+        if (mat == 3) {
+            // The lamp itself, at the shared emission level (ACES rolls it
+            // off to white, matching the path-traced half).
+            color += throughput * payload.albedo * emission;
+            break;
+        }
+
+        // ---- Glass: dispersive Fresnel reflect / refract ------------------
+        if (mat == 2) {
+            float ior = (hero == 0) ? IOR_R : (hero == 1) ? IOR_G : IOR_B;
+            float eta = (payload.frontFace > 0.5) ? (1.0 / ior) : ior;
+
+            float cosI = clamp(dot(-dir, N), 0.0, 1.0);
+            float R0   = (1.0 - 1.52) / (1.0 + 1.52); R0 *= R0;
+            float fres = R0 + (1.0 - R0) * pow(1.0 - cosI, 5.0);
+
+            vec3 refr = refract(dir, N, eta);
+            bool tir  = dot(refr, refr) < 1e-6;
+
+            float u = fresFresh ? fresU : rnd(seed);
+            fresFresh = false;
+            if (tir || u < fres) {
+                dir    = reflect(dir, N);
+                origin = payload.hitPos + N * eps;          // reflection stays full-colour
+            } else {
+                dir    = normalize(refr);
+                origin = payload.hitPos - N * eps;
+                if (!dispersed) {                            // collapse to the hero channel
+                    vec3 mask = (hero == 0) ? vec3(1,0,0)
+                              : (hero == 1) ? vec3(0,1,0) : vec3(0,0,1);
+                    throughput *= 3.0 * mask;
+                    dispersed = true;
+                }
+                throughput *= mix(vec3(1.0), payload.albedo, 0.65); // coloured glass
+            }
+            throughput *= vec3(0.98); // very light absorption
+            continue;
+        }
+
+        // ---- Floor / solid object -----------------------------------------
+        // Filter width: pixel footprint projected onto the plane. The 1/cos
+        // term stretches it at grazing angles (clamped so it can't explode).
+        float fw = pathLen * pixSpread / max(abs(dot(N, dir)), 0.25);
+        vec3 albedo = (mat == 0) ? checker(payload.hitPos, fw) : payload.albedo;
+
+        // Area light: cone subtended by the light sphere -> distance-dependent penumbra.
+        vec3  toLight = cam.lightPos.xyz - payload.hitPos;
+        float dist    = length(toLight);
+        vec3  Lc      = toLight / dist;
+        float sinMax  = clamp(cam.lightPos.w / dist, 0.0, 0.999);
+        float cosMax  = sqrt(1.0 - sinMax * sinMax);
+        float tmax    = dist - cam.lightPos.w * 1.001;
+
+        // Several shadow rays per hit -> smooth penumbra without leaning on accumulation.
+        const int SHADOW_SAMPLES = 6;
+        float diffAcc = 0.0;
+        for (int si = 0; si < SHADOW_SAMPLES; ++si) {
+            // Azimuth stratified over the samples -> even coverage of the light
+            // disc within one frame, less penumbra grain while the camera moves.
+            float u1 = rnd(seed);
+            float u2 = (float(si) + rnd(seed)) / float(SHADOW_SAMPLES);
+            vec3  Ls = sampleCone(Lc, cosMax, u1, u2);
+            float sh = traceShadow(payload.hitPos + N * eps, Ls, tmax);
+            diffAcc += max(dot(N, Ls), 0.0) * (1.0 - sh);
+        }
+        // cam.params.z is the light's emission radiance, shared with the path
+        // traced view through the common UBO. Convert it to the Whitted
+        // diffuse factor via the solid angle the light subtends:
+        // Le * Omega / pi = 2 * Le * (1 - cosMax). This makes the direct
+        // lighting match the path tracer's next-event estimate exactly, at
+        // every distance, so the halves differ only in what Whitted cannot
+        // compute (indirect light, caustics, colour bleeding).
+        float direct = 2.0 * emission * (1.0 - cosMax);
+        float diff  = (diffAcc / float(SHADOW_SAMPLES)) * direct;
+        // The constant ambient term is the Whitted stand-in for global
+        // illumination. Its level approximates the sky fill of the
+        // path-traced version so overall exposure matches; the qualitative
+        // differences (directional shadow fill, colour bleeding, caustics)
+        // remain, which is exactly what a side-by-side should show.
+        // Direct light carries the lamp colour (same Le tint as the path
+        // traced view); the ambient stand-in stays neutral by design.
+        vec3  local = albedo * (vec3(0.32) + diff * vec3(1.0, 0.95, 0.85));
+
+        float refl = payload.reflectivity;
+        color += throughput * local * (1.0 - refl);
+
+        if (refl <= 0.001) break;
+        throughput *= refl;
+        dir    = reflect(dir, N);
+        origin = payload.hitPos + N * eps;
+    }
+
+    // The path ran out of bounces while still inside a specular chain (thick or
+    // stacked glass, mirror corridors). Dropping it leaves black dirt; terminating
+    // into the sky is slightly biased but visually clean.
+    if (bounce > maxBounces)
+        color += throughput * skyColor(dir);
+
+    return color;
+}
+
+// ACES filmic tone map (Narkowicz fit): matches the path-traced version.
+vec3 acesToneMap(vec3 x) {
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+// Non-jittered centre primary ray -> world hit position (sky returns a stable far point).
+// Used only for the per-pixel motion test, so anti-alias jitter must NOT be applied here.
+vec3 primaryHitPos() {
+    vec2 pixel  = vec2(gl_LaunchIDEXT.xy) + 0.5;
+    vec2 inUV   = pixel / vec2(gl_LaunchSizeEXT.xy);
+    vec2 d      = inUV * 2.0 - 1.0;
+    vec3 origin = (cam.viewInverse * vec4(0, 0, 0, 1)).xyz;
+    vec4 target = cam.projInverse * vec4(d.x, d.y, 1, 1);
+    vec3 dir    = normalize((cam.viewInverse * vec4(normalize(target.xyz), 0)).xyz);
+    payload.t = 0.0;
+    traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, 0, 0, 0, origin, 0.001, dir, 10000.0, 0);
+    if (payload.t < 0.0) return origin + dir * 1000.0; // sky: stable while the camera is still
+    return payload.hitPos;
+}
+
+void main() {
+    int spp = max(1, int(cam.params.w));
+
+    vec3 color = vec3(0.0);
+    for (int s = 0; s < spp; ++s) {
+        // Seed from the free-running frame counter (frame.y), not the accumulation
+        // counter (frame.x), so the noise still changes frame-to-frame while moving.
+        uint seed = (gl_LaunchIDEXT.x * 1973u
+                   + gl_LaunchIDEXT.y * 9277u
+                   + (cam.frame.y * uint(spp) + uint(s)) * 26699u) | 1u;
+        color += renderSample(seed, s, spp);
+    }
+    color /= float(spp);
+
+    // ---- Per-pixel adaptive accumulation ----------------------------------
+    // Static pixels accumulate forever (converge to a clean, sharp image).
+    // Pixels where the geometry moved this frame reset, so objects being
+    // dragged around the editor stay sharp instead of smearing.
+    ivec2 pix = ivec2(gl_LaunchIDEXT.xy);
+    vec3  curPos  = primaryHitPos();
+    vec3  prevPos = imageLoad(histImage, pix).xyz;
+    vec3  eye     = (cam.viewInverse * vec4(0, 0, 0, 1)).xyz;
+    float camDist = distance(curPos, eye);
+    float moved   = distance(curPos, prevPos);
+    bool  reset   = (cam.frame.x == 0u) || (moved > 0.0008 * camDist + 0.0012);
+
+    vec4  prevAcc = imageLoad(accumImage, pix);
+    float count   = reset ? 0.0 : prevAcc.a;
+    vec3  accum   = (count < 0.5) ? color : mix(prevAcc.rgb, color, 1.0 / (count + 1.0));
+    count += 1.0;
+    imageStore(accumImage, pix, vec4(accum, count));
+    imageStore(histImage,  pix, vec4(curPos, 0.0));
+
+    // ACES tone map + gamma: the same display transform as the path-traced
+    // version, so colours and contrast are directly comparable.
+    vec3 outc = pow(acesToneMap(accum), vec3(1.0 / 2.2));
+
+    // ---- Editor marquee overlay (drawn over the final image, so it never ----
+    // ---- touches the accumulation buffers)                              ----
+    if (cam.marquee.z >= cam.marquee.x) {
+        vec2 p = vec2(pix);
+        bool inX = p.x >= cam.marquee.x && p.x <= cam.marquee.z;
+        bool inY = p.y >= cam.marquee.y && p.y <= cam.marquee.w;
+        bool border =
+            (inY && (abs(p.x - cam.marquee.x) < 1.5 || abs(p.x - cam.marquee.z) < 1.5)) ||
+            (inX && (abs(p.y - cam.marquee.y) < 1.5 || abs(p.y - cam.marquee.w) < 1.5));
+        if (border)            outc = mix(outc, vec3(1.0, 0.75, 0.2), 0.9);
+        else if (inX && inY)   outc = mix(outc, vec3(1.0, 0.75, 0.2), 0.08);
+    }
+
+    imageStore(outImage, pix, vec4(outc, 1.0));
+}

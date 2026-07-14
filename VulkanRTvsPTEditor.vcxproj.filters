@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source">
+      <UniqueIdentifier>{4a1d8b10-1111-4a2b-9c3d-111111111111}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Shaders">
+      <UniqueIdentifier>{4a1d8b10-2222-4a2b-9c3d-222222222222}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\main.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\vec3.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\mat3.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\mat4.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\rt_functions.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\scene_editor.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\vk_utils.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="shaders\raygen_rt.rgen">
+      <Filter>Shaders</Filter>
+    </None>
+    <None Include="shaders\raygen_pt.rgen">
+      <Filter>Shaders</Filter>
+    </None>
+    <None Include="shaders\atrous.comp">
+      <Filter>Shaders</Filter>
+    </None>
+    <None Include="shaders\closesthit.rchit">
+      <Filter>Shaders</Filter>
+    </None>
+    <None Include="shaders\miss.rmiss">
+      <Filter>Shaders</Filter>
+    </None>
+    <None Include="shaders\shadow.rmiss">
+      <Filter>Shaders</Filter>
+    </None>
+    <None Include="compile_shaders.bat" />
+    <None Include="README.md" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\vec3.h">
+      <Filter>Source</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mat3.h">
+      <Filter>Source</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mat4.h">
+      <Filter>Source</Filter>
+    </ClInclude>
+    <ClInclude Include="src\buffer.h">
+      <Filter>Source</Filter>
+    </ClInclude>
+    <ClInclude Include="src\config.h">
+      <Filter>Source</Filter>
+    </ClInclude>
+    <ClInclude Include="src\editor_ui.h">
+      <Filter>Source</Filter>
+    </ClInclude>
+    <ClInclude Include="src\gpu_types.h">
+      <Filter>Source</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mesh_info.h">
+      <Filter>Source</Filter>
+    </ClInclude>
+    <ClInclude Include="src\platform.h">
+      <Filter>Source</Filter>
+    </ClInclude>
+    <ClInclude Include="src\rt_functions.h">
+      <Filter>Source</Filter>
+    </ClInclude>
+    <ClInclude Include="src\scene_editor.h">
+      <Filter>Source</Filter>
+    </ClInclude>
+    <ClInclude Include="src\scene_object.h">
+      <Filter>Source</Filter>
+    </ClInclude>
+    <ClInclude Include="src\vk_utils.h">
+      <Filter>Source</Filter>
+    </ClInclude>
+  </ItemGroup>
+</Project>

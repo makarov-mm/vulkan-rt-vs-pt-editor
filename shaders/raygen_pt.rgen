@@ -1,0 +1,480 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+
+layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
+layout(binding = 1, set = 0, rgba8)   uniform image2D outImage;
+layout(binding = 2, set = 0) uniform CameraProperties {
+    mat4 viewInverse;
+    mat4 projInverse;
+    vec4 lightPos;   // xyz = position, w = radius (area light)
+    vec4 params;     // x = time, y = maxBounces, z = light emission strength, w = samples per frame
+    uvec4 frame;     // x = accumulated frame index (0 on camera move / scene edit)
+    vec4 marquee;    // rubber-band rect in pixels (x0,y0,x1,y1); x1 < x0 disables
+} cam;
+layout(binding = 5, set = 0, rgba32f) uniform image2D accumImage;
+layout(binding = 6, set = 0, rgba32f) uniform image2D histImage;   // xyz = prev primary hit, w = glass signature
+layout(binding = 8, set = 0, rgba32f) uniform image2D guideImage;  // xyz = primary normal, w = depth (0 = sky, < 0 = glass)
+layout(binding = 9, set = 0, rgba8)   uniform image2D albedoImage; // primary-hit albedo for SVGF demodulation
+
+struct HitPayload {
+    vec3  hitPos;
+    vec3  normal;       // faces against the incoming ray
+    vec3  albedo;
+    float reflectivity;
+    float matId;        // 0 = floor, 1 = solid, 2 = glass, 3 = emissive light
+    float t;            // < 0 means miss
+    float frontFace;    // 1 = ray hit the outer surface, 0 = inside
+    float selected;     // 1 = this object is selected in the editor
+};
+
+layout(location = 0) rayPayloadEXT HitPayload payload;
+layout(location = 1) rayPayloadEXT float      shadowed;
+
+// Per-channel IOR for chromatic dispersion (exaggerated for visibility).
+const float IOR_R = 1.50, IOR_G = 1.52, IOR_B = 1.54;
+
+const float PI      = 3.14159265358979;
+const float TWO_PI  = 6.28318530717959;
+const float EPS     = 0.001;
+
+// Per-sample radiance clamp: kills fireflies from rare low-probability paths
+// at the cost of a tiny amount of energy. Raise it for a more exact result.
+const float FIREFLY_CLAMP = 24.0;
+
+// ---------------------------------------------------------------------------
+//  PCG random number generator
+// ---------------------------------------------------------------------------
+uint pcg(inout uint state) {
+    state = state * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+float rnd(inout uint state) { return float(pcg(state)) * (1.0 / 4294967296.0); }
+
+// ---------------------------------------------------------------------------
+//  Helpers
+// ---------------------------------------------------------------------------
+vec3 skyColor(vec3 d) {
+    // The sky is a full environment light for the path tracer, so its energy
+    // sets the ambient level of the whole scene. Kept dim and saturated so the
+    // emissive sphere stays the key light and the image keeps its contrast.
+    float h = 0.5 * (normalize(d).y + 1.0);
+    return mix(vec3(0.42, 0.50, 0.62), vec3(0.10, 0.20, 0.45), h);
+}
+// Box-filtered checkerboard (iq). w = filter width in world units, i.e. how
+// much of the plane one pixel covers at this hit. At w -> 0 this equals the
+// old hard checker; at large w it converges to the mean grey, which is what
+// kills the moire on the floor and in its reflections.
+vec3 checker(vec3 p, float w) {
+    vec2 uv = p.xz;
+    vec2 fw = vec2(max(w, 1e-4));
+    vec2 i = 2.0 * (abs(fract((uv - 0.5 * fw) * 0.5) - 0.5)
+                  - abs(fract((uv + 0.5 * fw) * 0.5) - 0.5)) / fw;
+    float f = 0.5 - 0.5 * i.x * i.y;              // 0 = light cell, 1 = dark
+    return mix(vec3(0.85), vec3(0.10), f);
+}
+void basis(vec3 n, out vec3 t, out vec3 b) {
+    vec3 a = abs(n.x) > 0.9 ? vec3(0, 1, 0) : vec3(1, 0, 0);
+    t = normalize(cross(n, a));
+    b = cross(n, t);
+}
+
+// Cosine-weighted hemisphere sample around normal n. pdf = cos(theta) / PI.
+vec3 sampleCosineHemisphere(vec3 n, inout uint seed) {
+    float u1 = rnd(seed), u2 = rnd(seed);
+    float r   = sqrt(u1);
+    float phi = TWO_PI * u2;
+    vec3 t, b; basis(n, t, b);
+    float z = sqrt(max(0.0, 1.0 - u1));
+    return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * z);
+}
+
+// Uniform direction inside the cone of half-angle acos(cosThetaMax) around dir.
+// pdf (solid angle) = 1 / (2*PI*(1 - cosThetaMax)).
+vec3 sampleCone(vec3 dir, float cosThetaMax, float u1, float u2) {
+    float cosT = mix(1.0, cosThetaMax, u1);
+    float sinT = sqrt(max(0.0, 1.0 - cosT * cosT));
+    float phi  = TWO_PI * u2;
+    vec3 t, b; basis(dir, t, b);
+    return normalize(t * (cos(phi) * sinT) + b * (sin(phi) * sinT) + dir * cosT);
+}
+
+// Solid-angle pdf of sampling the spherical light from point p (0 if inside it).
+float lightSolidAnglePdf(vec3 p) {
+    vec3  toL  = cam.lightPos.xyz - p;
+    float d2   = dot(toL, toL);
+    float r    = cam.lightPos.w;
+    if (d2 <= r * r * 1.0201) return 0.0;      // inside / touching the light
+    float sinMax = clamp(r / sqrt(d2), 0.0, 0.999);
+    float cosMax = sqrt(1.0 - sinMax * sinMax);
+    return 1.0 / (TWO_PI * (1.0 - cosMax));
+}
+
+// Power heuristic (beta = 2) for multiple importance sampling.
+float powerHeuristic(float a, float b) {
+    float a2 = a * a;
+    return a2 / max(a2 + b * b, 1e-8);
+}
+
+float traceShadow(vec3 origin, vec3 L, float tmax) {
+    shadowed = 1.0;
+    traceRayEXT(topLevelAS,
+        gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+        0xFF, 0, 0, 1, origin, 0.001, L, tmax, 1);
+    return shadowed;
+}
+
+// ---------------------------------------------------------------------------
+//  Trace one full light-transport path for one (jittered) sample.
+//
+//  Monte Carlo path tracing:
+//   - diffuse surfaces bounce with cosine-weighted importance sampling,
+//     which gives full global illumination (colour bleeding, indirect light);
+//   - direct light is estimated at every diffuse vertex with next event
+//     estimation (one shadow ray toward the spherical area light), combined
+//     with BSDF sampling via multiple importance sampling (power heuristic);
+//   - the reflective lobe is chosen stochastically with probability
+//     `reflectivity` (a perfect mirror), the diffuse lobe otherwise;
+//   - glass keeps stochastic Fresnel reflect/refract with hero-wavelength
+//     dispersion, stratified over the frame's samples at the first glass hit;
+//   - Russian roulette terminates long paths without bias.
+// ---------------------------------------------------------------------------
+vec3 renderSample(inout uint seed, int sampleIdx, int spp) {
+    vec2 jitter = vec2(rnd(seed), rnd(seed)) - 0.5;
+    vec2 pixel  = vec2(gl_LaunchIDEXT.xy) + 0.5 + jitter;
+    vec2 inUV   = pixel / vec2(gl_LaunchSizeEXT.xy);
+    vec2 d      = inUV * 2.0 - 1.0;
+
+    vec3 origin = (cam.viewInverse * vec4(0, 0, 0, 1)).xyz;
+    vec4 target = cam.projInverse * vec4(d.x, d.y, 1, 1);
+    vec3 dir    = normalize((cam.viewInverse * vec4(normalize(target.xyz), 0)).xyz);
+
+    int   maxBounces = int(cam.params.y);
+    float emission   = cam.params.z;    // radiance scale of the area light
+
+    vec3 color      = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+
+    // MIS bookkeeping: was the previous bounce specular (mirror/glass), and if
+    // it was a diffuse BSDF sample, what were its pdf and origin vertex?
+    bool  lastSpecular = true;   // camera ray counts as specular: light is seen directly
+    float lastBsdfPdf  = 0.0;
+    vec3  lastOrigin   = origin;
+
+    // Spectral channel is fixed per sample (stratified), so over a frame each
+    // R/G/B channel gets an equal share -> dispersion with no channel noise.
+    int  hero      = sampleIdx % 3;     // 0 = R, 1 = G, 2 = B
+    bool dispersed = false;
+
+    // Stratified Fresnel decision for the FIRST glass hit of the path: sample s
+    // covers stratum (s/3) out of (spp/3), so the reflect/refract split is close
+    // to exact within a single frame instead of relying on accumulation.
+    int   strata    = max(spp / 3, 1);
+    float fresU     = (float(sampleIdx / 3) + rnd(seed)) / float(strata);
+    bool  fresFresh = true;
+
+    // Angular size of one pixel (radians). abs() because perspectiveVk bakes in
+    // the Vulkan Y flip, so projInverse[1][1] can be negative. Used to size the
+    // checker filter footprint; grows with accumulated path length, so the
+    // floor is filtered correctly in reflections too.
+    float pixSpread = 2.0 * abs(cam.projInverse[1][1]) / float(gl_LaunchSizeEXT.y);
+    float pathLen   = 0.0;
+
+    int bounce;
+    for (bounce = 0; bounce <= maxBounces; ++bounce) {
+        payload.t = 0.0;
+        traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, 0, 0, 0,
+                    origin, 0.001, dir, 10000.0, 0);
+
+        // ---- Miss: the sky is an environment light. It is never sampled by
+        // NEE (only the sphere light is), so BSDF hits collect it in full.
+        if (payload.t < 0.0) { color += throughput * skyColor(dir); break; }
+
+        pathLen += payload.t;
+        vec3 N   = normalize(payload.normal);
+        int  mat = int(payload.matId + 0.5);
+
+        // ---- Editor selection: warm rim highlight on the primary hit --------
+        if (bounce == 0 && payload.selected > 0.5) {
+            float cosI = clamp(dot(-dir, N), 0.0, 1.0);
+            float rim  = pow(1.0 - cosI, 3.0);
+            color += vec3(1.0, 0.62, 0.15) * (0.06 + 0.9 * rim) * 0.7;
+        }
+
+        // ---- Emissive area light hit by the path itself --------------------
+        if (mat == 3) {
+            vec3 Le = payload.albedo * emission;
+            if (lastSpecular) {
+                // Camera / mirror / glass paths: NEE cannot reach here, count in full.
+                color += throughput * Le;
+            } else {
+                // Diffuse BSDF sample found the light: MIS-weight it against
+                // the NEE estimate taken at the previous vertex.
+                float pdfL = lightSolidAnglePdf(lastOrigin);
+                float w    = powerHeuristic(lastBsdfPdf, pdfL);
+                color += throughput * Le * w;
+            }
+            break;
+        }
+
+        // ---- Glass: dispersive stochastic Fresnel reflect / refract --------
+        if (mat == 2) {
+            float ior = (hero == 0) ? IOR_R : (hero == 1) ? IOR_G : IOR_B;
+            float eta = (payload.frontFace > 0.5) ? (1.0 / ior) : ior;
+
+            float cosI = clamp(dot(-dir, N), 0.0, 1.0);
+            float R0   = (1.0 - 1.52) / (1.0 + 1.52); R0 *= R0;
+            float fres = R0 + (1.0 - R0) * pow(1.0 - cosI, 5.0);
+
+            vec3 refr = refract(dir, N, eta);
+            bool tir  = dot(refr, refr) < 1e-6;
+
+            float u = fresFresh ? fresU : rnd(seed);
+            fresFresh = false;
+            if (tir || u < fres) {
+                dir    = reflect(dir, N);
+                origin = payload.hitPos + N * EPS;          // reflection stays full-colour
+            } else {
+                dir    = normalize(refr);
+                origin = payload.hitPos - N * EPS;
+                if (!dispersed) {                            // collapse to the hero channel
+                    vec3 mask = (hero == 0) ? vec3(1,0,0)
+                              : (hero == 1) ? vec3(0,1,0) : vec3(0,0,1);
+                    throughput *= 3.0 * mask;
+                    dispersed = true;
+                }
+                throughput *= mix(vec3(1.0), payload.albedo, 0.65); // coloured glass
+            }
+            throughput *= vec3(0.98); // very light absorption
+            lastSpecular = true;
+        }
+        // ---- Floor / solid: diffuse + stochastic mirror lobe ---------------
+        else {
+            // Filter width: pixel footprint projected onto the plane. The 1/cos
+            // term stretches it at grazing angles (clamped so it can't explode).
+            float fw = pathLen * pixSpread / max(abs(dot(N, dir)), 0.25);
+            vec3 albedo = (mat == 0) ? checker(payload.hitPos, fw) : payload.albedo;
+            vec3 P      = payload.hitPos + N * EPS;
+
+            float refl = clamp(payload.reflectivity, 0.0, 1.0);
+
+            // Lobe selection: mirror with probability refl, diffuse otherwise.
+            // The 1/prob factor cancels the lobe weight, so throughput is
+            // simply passed through (mirror) or tinted by albedo (diffuse).
+            if (rnd(seed) < refl) {
+                dir          = reflect(dir, N);
+                origin       = P;
+                lastSpecular = true;
+            } else {
+                // -- Next event estimation toward the spherical area light --
+                vec3  toLight = cam.lightPos.xyz - payload.hitPos;
+                float dist    = length(toLight);
+                float radius  = cam.lightPos.w;
+                if (dist > radius * 1.01) {
+                    vec3  Lc     = toLight / dist;
+                    float sinMax = clamp(radius / dist, 0.0, 0.999);
+                    float cosMax = sqrt(1.0 - sinMax * sinMax);
+                    float pdfL   = 1.0 / (TWO_PI * (1.0 - cosMax));
+
+                    vec3  Ls    = sampleCone(Lc, cosMax, rnd(seed), rnd(seed));
+                    float cosNL = dot(N, Ls);
+                    if (cosNL > 0.0) {
+                        float tmax = dist - radius * 1.001;
+                        float sh   = traceShadow(P, Ls, tmax);
+                        if (sh < 0.5) {
+                            // Le * f_d * cos / pdf, MIS-weighted against the
+                            // cosine BSDF pdf for the same direction.
+                            vec3  Le   = vec3(1.0, 0.95, 0.85) * emission;
+                            float pdfB = cosNL / PI;
+                            float w    = powerHeuristic(pdfL, pdfB);
+                            color += throughput * (albedo / PI) * Le * cosNL / pdfL * w;
+                        }
+                    }
+                }
+
+                // -- Indirect bounce: cosine-weighted hemisphere sample ------
+                // f_d * cos / pdf = (albedo/PI) * cos / (cos/PI) = albedo.
+                vec3 wi = sampleCosineHemisphere(N, seed);
+                lastBsdfPdf  = max(dot(N, wi), 0.0) / PI;
+                lastOrigin   = payload.hitPos;
+                lastSpecular = false;
+                throughput  *= albedo;
+                dir    = wi;
+                origin = P;
+            }
+        }
+
+        // ---- Russian roulette: unbiased termination of long paths ----------
+        if (bounce >= 3) {
+            float p = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 0.95);
+            if (rnd(seed) >= p) break;
+            throughput /= p;
+        }
+    }
+
+    // The path ran out of bounces while still inside a specular chain (thick or
+    // stacked glass, mirror corridors). Dropping it leaves black dirt; terminating
+    // into the sky is slightly biased but visually clean.
+    if (bounce > maxBounces)
+        color += throughput * skyColor(dir);
+
+    return min(color, vec3(FIREFLY_CLAMP));
+}
+
+// Non-jittered centre primary ray. Used only by the temporal reprojection
+// probe, so anti-alias jitter must NOT be applied here.
+void centerRay(out vec3 origin, out vec3 dir) {
+    vec2 pixel  = vec2(gl_LaunchIDEXT.xy) + 0.5;
+    vec2 inUV   = pixel / vec2(gl_LaunchSizeEXT.xy);
+    vec2 d      = inUV * 2.0 - 1.0;
+    origin = (cam.viewInverse * vec4(0, 0, 0, 1)).xyz;
+    vec4 target = cam.projInverse * vec4(d.x, d.y, 1, 1);
+    dir = normalize((cam.viewInverse * vec4(normalize(target.xyz), 0)).xyz);
+}
+
+// Centre-ray probe -> world hit position (sky returns a stable far point).
+vec3 primaryHitPos() {
+    vec3 origin, dir;
+    centerRay(origin, dir);
+    payload.t = 0.0;
+    traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, 0, 0, 0, origin, 0.001, dir, 10000.0, 0);
+    if (payload.t < 0.0) return origin + dir * 1000.0; // sky: stable while the camera is still
+    return payload.hitPos;
+}
+
+// Glass motion signature: total path length along the deterministic delta
+// chain (refract, or reflect on TIR, at the mid IOR) until the first
+// non-glass surface. The primary-hit motion test alone cannot see movement
+// *behind* or *inside* glass -- the surface may be static (an object dragged
+// behind a glass shape) or moving less than the reset threshold while the
+// refracted content changes, which the accumulation would smear into ghosts.
+// The signature is fully deterministic, so for a static scene it is
+// bit-stable and any change means real motion.
+float glassMotionSig(vec3 hitPos, vec3 N, float frontFace, vec3 dir) {
+    float sig = 0.0;
+    vec3  o  = hitPos;
+    vec3  d  = dir;
+    vec3  n  = N;
+    float ff = frontFace;
+    for (int i = 0; i < 6; ++i) {
+        float eta = (ff > 0.5) ? (1.0 / IOR_G) : IOR_G;
+        vec3 r = refract(d, n, eta);
+        if (dot(r, r) < 1e-6) { d = reflect(d, n); o += n * EPS; }
+        else                  { d = normalize(r);  o -= n * EPS; }
+        payload.t = 0.0;
+        traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, 0, 0, 0, o, 0.001, d, 10000.0, 0);
+        if (payload.t < 0.0) { sig += 1000.0; break; }   // sky: stable terminator
+        sig += payload.t;
+        if (int(payload.matId + 0.5) != 2) break;
+        o  = payload.hitPos;
+        n  = normalize(payload.normal);
+        ff = payload.frontFace;
+    }
+    return sig;
+}
+
+// ACES filmic tone map (Narkowicz fit): HDR path-traced radiance -> display range.
+vec3 acesToneMap(vec3 x) {
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+void main() {
+    int spp = max(1, int(cam.params.w));
+
+    vec3 color = vec3(0.0);
+    for (int s = 0; s < spp; ++s) {
+        // Seed from the free-running frame counter (frame.y), not the accumulation
+        // counter (frame.x), so the noise still changes frame-to-frame while moving.
+        uint seed = (gl_LaunchIDEXT.x * 1973u
+                   + gl_LaunchIDEXT.y * 9277u
+                   + (cam.frame.y * uint(spp) + uint(s)) * 26699u) | 1u;
+        color += renderSample(seed, s, spp);
+    }
+    color /= float(spp);
+
+    // ---- Per-pixel adaptive accumulation ----------------------------------
+    // Static pixels accumulate forever (converge to a clean, sharp image).
+    // Pixels where the geometry moved this frame reset, so objects being
+    // dragged around the editor stay sharp instead of smearing.
+    ivec2 pix = ivec2(gl_LaunchIDEXT.xy);
+    vec3  curPos  = primaryHitPos();
+
+    // The payload still holds the centre primary hit: feed the denoiser.
+    // Guide: geometric edges (normal + depth). Albedo: what the a-trous filter
+    // divides out before filtering (demodulation), so the checkerboard and
+    // object colours stay sharp while the noisy irradiance gets smoothed.
+    // Specular materials (glass) and the sky use white = no-op.
+    bool  probeGlass = false;
+    vec3  probeN     = vec3(0.0);
+    float probeFF    = 1.0;
+    {
+        bool sky = payload.t < 0.0;
+        vec3 gN  = sky ? vec3(0.0) : normalize(payload.normal);
+        float gZ = sky ? 0.0 : payload.t;
+        int  m   = int(payload.matId + 0.5);
+        // Delta-specular primary hits (glass): the guide describes the glass
+        // surface, not the refracted content behind it, so the a-trous filter
+        // would average wildly different transmitted radiance into a milky
+        // frosted look. Negative depth tells the denoiser to pass these pixels
+        // through untouched (and excludes them as filter neighbours).
+        if (!sky && m == 2) { gZ = -gZ; probeGlass = true; probeN = gN; probeFF = payload.frontFace; }
+        vec3 alb = vec3(1.0);
+        if (!sky && m == 0) {
+            vec3 co, cd;
+            centerRay(co, cd);
+            float fw = payload.t
+                     * (2.0 * abs(cam.projInverse[1][1]) / float(gl_LaunchSizeEXT.y))
+                     / max(abs(dot(gN, cd)), 0.25);
+            alb = checker(payload.hitPos, fw);
+        }
+        if (!sky && m == 1) alb = payload.albedo;
+        imageStore(guideImage,  pix, vec4(gN, gZ));
+        imageStore(albedoImage, pix, vec4(alb, 1.0));
+    }
+
+    // Glass pixels get a second reprojection key: the delta-chain signature.
+    // (This clobbers the payload, so it runs after the guide write.)
+    float curSig = 0.0;
+    if (probeGlass) {
+        vec3 co, cd;
+        centerRay(co, cd);
+        curSig = glassMotionSig(curPos, probeN, probeFF, cd);
+    }
+
+    vec4  prevHist = imageLoad(histImage, pix);
+    vec3  prevPos  = prevHist.xyz;
+    float prevSig  = prevHist.w;
+    vec3  eye     = (cam.viewInverse * vec4(0, 0, 0, 1)).xyz;
+    float camDist = distance(curPos, eye);
+    float moved   = distance(curPos, prevPos);
+    bool  reset   = (cam.frame.x == 0u)
+                 || (moved > 0.0008 * camDist + 0.0012)
+                 || (abs(curSig - prevSig) > 0.02);
+
+    vec4  prevAcc = imageLoad(accumImage, pix);
+    float count   = reset ? 0.0 : prevAcc.a;
+    vec3  accum   = (count < 0.5) ? color : mix(prevAcc.rgb, color, 1.0 / (count + 1.0));
+    count += 1.0;
+    imageStore(accumImage, pix, vec4(accum, count));
+    imageStore(histImage,  pix, vec4(curPos, curSig));
+
+    // HDR accumulation -> ACES tone map -> gamma. When the denoiser is on, the
+    // compute pass overwrites this with the filtered result (same tone map).
+    vec3 outc = pow(acesToneMap(accum), vec3(1.0 / 2.2));
+
+    // ---- Editor marquee overlay (drawn over the final image, so it never ----
+    // ---- touches the accumulation buffers)                              ----
+    if (cam.marquee.z >= cam.marquee.x) {
+        vec2 p = vec2(pix);
+        bool inX = p.x >= cam.marquee.x && p.x <= cam.marquee.z;
+        bool inY = p.y >= cam.marquee.y && p.y <= cam.marquee.w;
+        bool border =
+            (inY && (abs(p.x - cam.marquee.x) < 1.5 || abs(p.x - cam.marquee.z) < 1.5)) ||
+            (inX && (abs(p.y - cam.marquee.y) < 1.5 || abs(p.y - cam.marquee.w) < 1.5));
+        if (border)            outc = mix(outc, vec3(1.0, 0.75, 0.2), 0.9);
+        else if (inX && inY)   outc = mix(outc, vec3(1.0, 0.75, 0.2), 0.08);
+    }
+
+    imageStore(outImage, pix, vec4(outc, 1.0));
+}
