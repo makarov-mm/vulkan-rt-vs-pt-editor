@@ -1,6 +1,8 @@
 #pragma once
 #include <cmath>
 
+#include "cxx26.h"
+
 struct Vec3 
 {
     float x = 0, y = 0, z = 0;
@@ -22,9 +24,13 @@ struct Vec3
         };
     }
 
-    // std::sqrt becomes constexpr only in C++26 (P1383); kept out of line
-    // until compiler support is universal.
-    Vec3 normalize() const noexcept;
+    // constexpr once the standard library ships constexpr std::sqrt
+    // (C++26, P1383); see CXX26_CONSTEXPR_MATH in cxx26.h.
+    CXX26_CONSTEXPR_MATH Vec3 normalize() const noexcept
+    {
+        float l = std::sqrt(dot(*this));
+        return l > 0 ? Vec3{ x / l, y / l, z / l } : *this;
+    }
 };
 
 constexpr Vec3 operator+(const Vec3& a, const Vec3& b) noexcept

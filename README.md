@@ -104,6 +104,24 @@ image, so there is no GDI flicker over the swapchain.
 - Ray-gen / closest-hit / two miss shaders, a correctly aligned shader binding
   table, `maxPipelineRayRecursionDepth = 1` (all bounces iterate in ray-gen).
 
+## C++26
+
+The project builds as C++26 (`/std:c++latest`). Because MSVC currently
+implements very little of the C++26 paper set, every C++26 feature is adopted
+through its standard feature test macro in `src/cxx26.h` and degrades
+gracefully until the toolchain catches up:
+
+- `std::inplace_vector` (P0843) for Vulkan descriptor scratch arrays, where
+  its by-type pointer-stability guarantee is exactly what
+  `vkUpdateDescriptorSets` needs (minimal polyfill until MSVC STL ships it)
+- `= delete("reason")` (P2573) on the editor's copy operations, documenting
+  *why* an owner of raw Vulkan handles must not be copied
+- constexpr `std::sqrt` (P1383) making `Vec3::normalize` constexpr the moment
+  the standard library allows it
+- GPU-side layout contracts (`UBO`, `GpuObj`, `Vertex`, the denoiser push
+  constants) are pinned with `static_assert`, so a host/GLSL layout mismatch
+  fails the build instead of rendering garbage
+
 ## Requirements
 
 - Windows 10/11, x64

@@ -6,6 +6,7 @@
 
 #include "platform.h"
 #include "config.h"
+#include "cxx26.h"
 #include "vec3.h"
 #include "mat3.h"
 #include "mat4.h"
@@ -19,6 +20,14 @@
 //  Scene editor
 // =============================================================================
 class SceneEditor {
+public:
+    // The editor owns every Vulkan handle it creates; copying or moving it
+    // would double-destroy them in cleanup(). C++26 attaches the reason to
+    // the deletion itself (P2573); until MSVC ships it, the macro degrades
+    // to a plain = delete.
+    SceneEditor() = default;
+    SceneEditor(const SceneEditor&)            = CXX26_DELETED("SceneEditor owns raw Vulkan handles; copying would double-destroy them");
+    SceneEditor& operator=(const SceneEditor&) = CXX26_DELETED("SceneEditor owns raw Vulkan handles; copying would double-destroy them");
 public:
     void run(HINSTANCE hInst);
 
@@ -157,6 +166,8 @@ private:
         float   _pad0, _pad1;
         float   marquee[4];
     };
+    static_assert(sizeof(DenoisePC) == 48,
+        "DenoisePC must match the push_constant block in atrous.comp (vec4 marquee is 16-aligned)");
     VkDescriptorSetLayout denoiseLayout     = VK_NULL_HANDLE;
     VkDescriptorSet       denoiseSets[3]    = {};   // 0: accum->ping, 1: ping->pong, 2: pong->ping
     VkPipelineLayout      denoisePipeLayout = VK_NULL_HANDLE;

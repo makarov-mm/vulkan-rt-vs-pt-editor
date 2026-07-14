@@ -88,7 +88,6 @@ xcopy /Y /D "$(SolutionDir)icons\*.png" "$(OutDir)icons\"</Command>
     <ClCompile Include="src\mat4.cpp" />
     <ClCompile Include="src\rt_functions.cpp" />
     <ClCompile Include="src\scene_editor.cpp" />
-    <ClCompile Include="src\vec3.cpp" />
     <ClCompile Include="src\vk_utils.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -114,6 +113,7 @@ xcopy /Y /D "$(SolutionDir)icons\*.png" "$(OutDir)icons\"</Command>
     <ClInclude Include="src\scene_editor.h" />
     <ClInclude Include="src\scene_object.h" />
     <ClInclude Include="src\vec3.h" />
+    <ClInclude Include="src\cxx26.h" />
     <ClInclude Include="src\vk_utils.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

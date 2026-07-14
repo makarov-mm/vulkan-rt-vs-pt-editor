@@ -1,6 +1,9 @@
 #include "scene_editor.h"
 
 #include <numbers>
+#if defined(__cpp_lib_print)
+#  include <print>
+#endif
 
 // One project-wide pi (C++20 <numbers>), instead of per-function literals.
 constexpr float PI = std::numbers::pi_v<float>;
@@ -689,7 +692,11 @@ VKAPI_ATTR VkBool32 VKAPI_CALL SceneEditor::debugCB(
     VkDebugUtilsMessageTypeFlagsEXT,
     const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
     if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)
+#if defined(__cpp_lib_print)
+        std::println(stderr, "[Vulkan] {}", data->pMessage);
+#else
         std::fprintf(stderr, "[Vulkan] %s\n", data->pMessage);
+#endif
     return VK_FALSE;
 }
 
@@ -1568,10 +1575,11 @@ void SceneEditor::createDescriptors() {
     VkDescriptorImageInfo guideInfo{ VK_NULL_HANDLE, guideView,  VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo albInfo  { VK_NULL_HANDLE, albedoView, VK_IMAGE_LAYOUT_GENERAL };
 
-    std::vector<VkDescriptorImageInfo> imgInfos;   // stable addresses for pImageInfo
-    imgInfos.reserve(2 * 3);
-    std::vector<VkWriteDescriptorSet> writes;
-    writes.reserve(2 * 10);
+    // FixedVector (std::inplace_vector, C++26 P0843) guarantees by type what
+    // vector + reserve only promises by convention: elements never relocate,
+    // so &imgInfos.back() stays valid until vkUpdateDescriptorSets consumes it.
+    FixedVector<VkDescriptorImageInfo, 2 * 3> imgInfos;
+    FixedVector<VkWriteDescriptorSet, 2 * 10> writes;
 
     for (RendererView& v : views) {
         auto write = [&](uint32_t binding, VkDescriptorType type,
@@ -1765,10 +1773,8 @@ void SceneEditor::createDenoiser() {
     VkImageView ins [3] = { views[VIEW_PT].accumView, pingView, pongView };
     VkImageView outs[3] = { pingView,  pongView, pingView };
 
-    std::vector<VkDescriptorImageInfo> infos;
-    infos.reserve(15);
-    std::vector<VkWriteDescriptorSet> writes;
-    writes.reserve(15);
+    FixedVector<VkDescriptorImageInfo, 15> infos;   // pointer-stable, see createDescriptors
+    FixedVector<VkWriteDescriptorSet, 15>  writes;
     for (int s = 0; s < 3; ++s) {
         VkImageView bound[5] = { ins[s], outs[s], guideView, views[VIEW_PT].storageView, albedoView };
         for (uint32_t b = 0; b < 5; ++b) {

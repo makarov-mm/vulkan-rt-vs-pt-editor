@@ -29,3 +29,12 @@ struct GpuObj
     float    params[4];    // x = matId (0 floor, 1 solid, 2 glass, 3 emissive), y = reflectivity
     uint32_t mesh[4];      // x = first index of this instance's mesh in the shared index buffer
 };
+
+// -----------------------------------------------------------------------------
+//  Layout contract with the GLSL side. These sizes are what the shaders
+//  expect; if a field is added or reordered, the build fails here instead of
+//  rendering garbage.
+// -----------------------------------------------------------------------------
+static_assert(sizeof(Vertex) == 32,  "Vertex must match the std430 layout in closesthit.rchit (two vec4)");
+static_assert(sizeof(UBO)    == 192, "UBO must match the CameraProperties block in the raygen shaders");
+static_assert(sizeof(GpuObj) == 48,  "GpuObj must match the ObjData struct in closesthit.rchit (three vec4-sized rows)");
