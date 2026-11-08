@@ -4,6 +4,6 @@
 layout(location = 1) rayPayloadInEXT float shadowed;
 
 void main() {
-    // If the shadow ray reaches here, nothing blocked the light.
+    // The shadow ray reached its end: nothing blocks the light.
     shadowed = 0.0;
 }

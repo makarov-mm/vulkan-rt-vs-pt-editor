@@ -1,36 +1,20 @@
 #include "mat3.h"
-#include "vec3.h"
 
-Mat3 rot_axis(const Vec3& a, float ang) noexcept
-{
-    Vec3 axis = a.normalize();
+Mat3 Mat3::rotation(const Vec3& axis, float angle) noexcept {
+    const Vec3  a = axis.normalize();
+    const float c = std::cos(angle);
+    const float s = std::sin(angle);
+    const float t = 1.0f - c;
 
-    float c = std::cos(ang);
-    float s = std::sin(ang);
-    float t = 1 - c;
-
-    float x = axis.x;
-    float y = axis.y;
-	float z = axis.z;
-
-    Mat3 m;
-    m.c0 = {
-    	c + x * x * t,
-    	x * y * t + z * s,
-    	x * z * t - y * s
+    return {
+        { c + a.x * a.x * t,       a.x * a.y * t + a.z * s, a.x * a.z * t - a.y * s },
+        { a.x * a.y * t - a.z * s, c + a.y * a.y * t,       a.y * a.z * t + a.x * s },
+        { a.x * a.z * t + a.y * s, a.y * a.z * t - a.x * s, c + a.z * a.z * t       },
     };
+}
 
-    m.c1 = { 
-    	x * y * t - z * s,
-    	c + y * y * t,
-    	y * z * t + x * s
-    };
-
-    m.c2 = { 
-    	x * z * t + y * s, 
-    	y * z * t - x * s, 
-    	c + z * z * t
-    };
-
-    return m;
+Mat3 Mat3::orthonormalized() const noexcept {
+    const Vec3 x = c0.normalize();
+    const Vec3 y = (c1 - x * x.dot(c1)).normalize();
+    return { x, y, x.cross(y) };
 }

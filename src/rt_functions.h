@@ -2,9 +2,10 @@
 #include "platform.h"
 
 // -----------------------------------------------------------------------------
-//  Ray tracing entry points (loaded at runtime; not exported by the loader lib)
+//  VK_KHR_acceleration_structure / VK_KHR_ray_tracing_pipeline entry points.
+//  Extension functions are not exported by the loader library, so they are
+//  fetched per device at startup.
 // -----------------------------------------------------------------------------
-extern PFN_vkGetBufferDeviceAddress                   pvkGetBufferDeviceAddress;
 extern PFN_vkCreateAccelerationStructureKHR           pvkCreateAccelerationStructure;
 extern PFN_vkDestroyAccelerationStructureKHR          pvkDestroyAccelerationStructure;
 extern PFN_vkGetAccelerationStructureBuildSizesKHR    pvkGetAccelerationStructureBuildSizes;

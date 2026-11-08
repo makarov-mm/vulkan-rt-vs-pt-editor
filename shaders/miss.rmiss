@@ -1,19 +1,8 @@
 #version 460
 #extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : require
 
-// Must match the HitPayload declared in raygen.rgen / closesthit.rchit
-// field-for-field: payloads on the same location are shared memory, and a
-// shorter struct here is undefined behaviour (worked by luck on some drivers).
-struct HitPayload {
-    vec3  hitPos;
-    vec3  normal;
-    vec3  albedo;
-    float reflectivity;
-    float matId;
-    float t;
-    float frontFace;
-    float selected;
-};
+#include "payload.glsl"
 
 layout(location = 0) rayPayloadInEXT HitPayload payload;
 

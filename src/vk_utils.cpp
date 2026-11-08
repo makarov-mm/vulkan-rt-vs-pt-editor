@@ -1,14 +1,12 @@
 #include "vk_utils.h"
 
-#include <cstdio>
+#include <format>
 #include <stdexcept>
 
-void vkCheck(VkResult r, const char* what)
-{
-    if (r != VK_SUCCESS) 
-    {
-        char buf[256];
-        std::snprintf(buf, sizeof(buf), "Vulkan call failed (%d): %s", static_cast<int>(r), what);
-        throw std::runtime_error(buf);
-    }
+void vkCheck(VkResult r, const char* what, std::source_location loc) {
+    if (r == VK_SUCCESS) return;
+    throw std::runtime_error(what
+        ? std::format("Vulkan call failed ({}): {}", static_cast<int>(r), what)
+        : std::format("Vulkan call failed ({}) in {} ({}:{})",
+                      static_cast<int>(r), loc.function_name(), loc.file_name(), loc.line()));
 }

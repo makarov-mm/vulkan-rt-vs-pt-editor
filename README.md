@@ -17,8 +17,9 @@ one camera and one TLAS, so every edit, drag and orbit is perfectly
 synchronized - a live side-by-side of what 1980 ray tracing misses and 1986
 path tracing integrates: shadow fill, colour bleeding, caustics.
 
-The two renderers share the miss, shadow-miss and closest-hit shaders and the
-whole editor; they differ in exactly one file each - the ray-gen shader
+The two renderers share the miss, shadow-miss and closest-hit shaders, the
+whole editor and all common ray-gen code (`shaders/raygen_common.glsl`); they
+differ only in how surfaces are shaded - the ray-gen shader
 (`raygen_rt.rgen` vs `raygen_pt.rgen`). The display transform (ACES + gamma),
 sky, materials and light levels are calibrated to match, so any difference you
 see on screen is algorithmic, not tonal.
@@ -103,12 +104,17 @@ image, so there is no GDI flicker over the swapchain.
   also restarts accumulation so changes always show up clean.
 - Ray-gen / closest-hit / two miss shaders, a correctly aligned shader binding
   table, `maxPipelineRayRecursionDepth = 1` (all bounces iterate in ray-gen).
+- Vertex and index data live in device-local memory (staged upload); the small
+  per-frame buffers (UBO, instances, object data) use device-local host-visible
+  memory when the GPU exposes it (resizable BAR) and stay persistently mapped.
 
-## C++26
+## C++
 
-The project builds as C++26 (`/std:c++latest`). Because MSVC currently
-implements very little of the C++26 paper set, every C++26 feature is adopted
-through its standard feature test macro in `src/cxx26.h` and degrades
+The project builds with `/std:c++latest` and uses C++23 throughout
+(`std::print`, `std::format`, ranges, `std::to_underlying`, designated
+initializers, `std::source_location` in Vulkan error messages). MSVC
+implements only part of the C++26 paper set so far, so every C++26 feature is
+adopted through its standard feature test macro in `src/cxx26.h` and degrades
 gracefully until the toolchain catches up:
 
 - `std::inplace_vector` (P0843) for Vulkan descriptor scratch arrays, where
@@ -129,27 +135,49 @@ gracefully until the toolchain catches up:
   Intel Arc) and recent drivers
 - [Vulkan SDK](https://vulkan.lunarg.com/) (the `VULKAN_SDK` environment
   variable must be set - the installer does this)
-- Visual Studio 2022+ with the C++ workload
+- Visual Studio 2026 (toolset v145) with the C++ workload
 
 ## Building
 
-Open `VulkanRTSceneEditor.sln` and build (x64, Debug or Release). The
+Open `VulkanRTvsPTEditor.slnx` and build (x64, Debug or Release). The
 pre-build step compiles the GLSL shaders to SPIR-V with the SDK's
-`glslangValidator`; the post-build step copies them next to the executable.
+`glslangValidator`; the post-build step copies them and the icons next to the
+executable. Debug builds enable the Khronos validation layer when it is
+installed and run without it otherwise.
+
+## Source layout
+
+| File | Contents |
+|------|----------|
+| `src/main.cpp` | Entry point, GDI+ session, error reporting |
+| `src/scene_editor.h` / `.cpp` | Editor class; frame loop and command recording |
+| `src/editor_input.cpp` | Win32 windows, toolbar, mouse / keyboard, picking, marquee |
+| `src/vulkan_setup.cpp` | Device, swapchain, buffers, acceleration structures, pipelines, SBT, denoiser |
+| `src/mesh_builder.h` / `.cpp` | Procedural prototype shapes |
+| `src/camera.h` / `.cpp` | Orbit camera; CPU rays and projection matching the shaders |
+| `src/gpu_types.h` | Host mirrors of the shader data layouts |
+| `src/config.h` | Window size, light, camera and quality constants |
+| `shaders/payload.glsl` | Hit payload and material ids shared by all ray tracing stages |
+| `shaders/raygen_common.glsl` | Everything both ray-gen shaders share |
+| `shaders/display.glsl` | Tone map and marquee overlay (ray-gen and denoiser) |
 
 ## Architecture notes
 
 The editor path is deliberately cheap. On any scene edit:
 
 1. The instance array (`VkAccelerationStructureInstanceKHR`, one per object)
-   and the per-object shading SSBO are rewritten on the host.
-2. The TLAS is rebuilt (`PREFER_FAST_BUILD`) - with at most 64 instances this
-   is sub-millisecond.
+   and the per-object shading SSBO are rewritten on the host (both persistently
+   mapped).
+2. The TLAS rebuild (`PREFER_FAST_BUILD`) is recorded at the start of that
+   frame's command buffer, followed by a barrier to the ray tracing stage - no
+   extra submit and no queue stall. With at most 64 instances it is
+   sub-millisecond.
 3. The accumulation counter resets, and the per-pixel history test
    additionally resets exactly the pixels whose primary hit moved.
 
 BLASes are static and never rebuilt, which is what lets them use
-`PREFER_FAST_TRACE` for maximum traversal performance. Object picking is a
+`PREFER_FAST_TRACE` for maximum traversal performance. All of them are built
+at startup in a single command, each with its own slice of one scratch buffer. Object picking is a
 CPU ray against per-instance bounding spheres; marquee selection projects the
 same bounding spheres to the screen and tests them against the rectangle.
 

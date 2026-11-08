@@ -1,6 +1,7 @@
 @echo off
-REM Compile all ray tracing shaders to SPIR-V using the Vulkan SDK's glslangValidator.
-REM Run automatically as a pre-build step, or manually by double-clicking.
+REM Compile the ray tracing and denoiser shaders to SPIR-V with the Vulkan SDK's
+REM glslangValidator. Runs as the pre-build step; can also be run by hand.
+REM The *.glsl files are shared includes and are not compiled on their own.
 
 setlocal
 cd /d "%~dp0shaders"
