@@ -89,13 +89,16 @@ xcopy /Y /D "$(ProjectDir)icons\*.png" "$(OutDir)icons\"</Command>
   <ItemGroup>
     <ClCompile Include="src\camera.cpp" />
     <ClCompile Include="src\editor_input.cpp" />
+    <ClCompile Include="src\editor_window.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\mat3.cpp" />
     <ClCompile Include="src\mesh_builder.cpp" />
-    <ClCompile Include="src\rt_functions.cpp" />
+    <ClCompile Include="src\presenter.cpp" />
+    <ClCompile Include="src\renderer.cpp" />
+    <ClCompile Include="src\scene.cpp" />
     <ClCompile Include="src\scene_editor.cpp" />
+    <ClCompile Include="src\vk_context.cpp" />
     <ClCompile Include="src\vk_utils.cpp" />
-    <ClCompile Include="src\vulkan_setup.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\camera.h" />
@@ -107,10 +110,12 @@ xcopy /Y /D "$(ProjectDir)icons\*.png" "$(OutDir)icons\"</Command>
     <ClInclude Include="src\mat4.h" />
     <ClInclude Include="src\mesh_builder.h" />
     <ClInclude Include="src\platform.h" />
-    <ClInclude Include="src\rt_functions.h" />
+    <ClInclude Include="src\presenter.h" />
+    <ClInclude Include="src\renderer.h" />
+    <ClInclude Include="src\scene.h" />
     <ClInclude Include="src\scene_editor.h" />
-    <ClInclude Include="src\scene_object.h" />
     <ClInclude Include="src\vec3.h" />
+    <ClInclude Include="src\vk_context.h" />
     <ClInclude Include="src\vk_utils.h" />
   </ItemGroup>
   <ItemGroup>

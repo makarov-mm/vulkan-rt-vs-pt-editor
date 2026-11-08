@@ -104,6 +104,9 @@ image, so there is no GDI flicker over the swapchain.
   also restarts accumulation so changes always show up clean.
 - Ray-gen / closest-hit / two miss shaders, a correctly aligned shader binding
   table, `maxPipelineRayRecursionDepth = 1` (all bounces iterate in ray-gen).
+- Vulkan 1.3 synchronization2: every barrier carries its own stages and
+  accesses, and the barriers of one dependency point are recorded with a
+  single `vkCmdPipelineBarrier2`.
 - Vertex and index data live in device-local memory (staged upload); the small
   per-frame buffers (UBO, instances, object data) use device-local host-visible
   memory when the GPU exposes it (resizable BAR) and stay persistently mapped.
@@ -119,20 +122,21 @@ gracefully until the toolchain catches up:
 
 - `std::inplace_vector` (P0843) for Vulkan descriptor scratch arrays, where
   its by-type pointer-stability guarantee is exactly what
-  `vkUpdateDescriptorSets` needs (minimal polyfill until MSVC STL ships it)
-- `= delete("reason")` (P2573) on the editor's copy operations, documenting
-  *why* an owner of raw Vulkan handles must not be copied
+  `vkUpdateDescriptorSets` needs, and for barrier batches (minimal polyfill
+  until MSVC STL ships it)
+- `= delete("reason")` (P2573) on the copy operations of every owner of raw
+  Vulkan / Win32 handles, documenting *why* it must not be copied
 - constexpr `std::sqrt` (P1383) making `Vec3::normalize` constexpr the moment
   the standard library allows it
-- GPU-side layout contracts (`UBO`, `GpuObj`, `Vertex`, the denoiser push
-  constants) are pinned with `static_assert`, so a host/GLSL layout mismatch
-  fails the build instead of rendering garbage
+- GPU-side layout contracts (`FrameUniforms`, `GpuObj`, `Vertex`, the denoiser
+  push constants) are pinned with `static_assert`, so a host/GLSL layout
+  mismatch fails the build instead of rendering garbage
 
 ## Requirements
 
 - Windows 10/11, x64
-- A GPU with `VK_KHR_ray_tracing_pipeline` support (NVIDIA RTX, AMD RX 6000+,
-  Intel Arc) and recent drivers
+- A GPU with Vulkan 1.3 and `VK_KHR_ray_tracing_pipeline` support (NVIDIA RTX,
+  AMD RX 6000+, Intel Arc) and recent drivers
 - [Vulkan SDK](https://vulkan.lunarg.com/) (the `VULKAN_SDK` environment
   variable must be set - the installer does this)
 - Visual Studio 2026 (toolset v145) with the C++ workload
@@ -142,18 +146,28 @@ gracefully until the toolchain catches up:
 Open `VulkanRTvsPTEditor.slnx` and build (x64, Debug or Release). The
 pre-build step compiles the GLSL shaders to SPIR-V with the SDK's
 `glslangValidator`; the post-build step copies them and the icons next to the
-executable. Debug builds enable the Khronos validation layer when it is
-installed and run without it otherwise.
+executable, where the editor looks for them first (then in the working
+directory). Debug builds open a console and enable the Khronos validation
+layer when it is installed; release builds only print to the console they
+were started from.
 
 ## Source layout
 
+The Vulkan side (`vk_context`, `renderer`, `presenter`) is platform
+independent; everything Win32 lives in the editor files.
+
 | File | Contents |
 |------|----------|
-| `src/main.cpp` | Entry point, GDI+ session, error reporting |
-| `src/scene_editor.h` / `.cpp` | Editor class; frame loop and command recording |
-| `src/editor_input.cpp` | Win32 windows, toolbar, mouse / keyboard, picking, marquee |
-| `src/vulkan_setup.cpp` | Device, swapchain, buffers, acceleration structures, pipelines, SBT, denoiser |
-| `src/mesh_builder.h` / `.cpp` | Procedural prototype shapes |
+| `src/main.cpp` | Entry point, GDI+ session, console, error reporting |
+| `src/scene_editor.h` / `.cpp` | Editor class: lifecycle, frame loop, editor actions |
+| `src/editor_window.cpp` | Win32 window procedures, toolbar, icons |
+| `src/editor_input.cpp` | Mouse / keyboard, picking, marquee selection |
+| `src/vk_context.h` / `.cpp` | Instance, device, queue, ray tracing entry points, buffer / image / shader helpers |
+| `src/renderer.h` / `.cpp` | Both renderers: acceleration structures, images, pipelines, SBT, denoiser, per-frame recording |
+| `src/presenter.h` / `.cpp` | Swapchain, frame pacing, blit and present |
+| `src/vk_utils.h` / `.cpp` | `vkCheck`, buffer / image handles, synchronization2 barrier batches |
+| `src/scene.h` / `.cpp` | Shape types, materials, scene objects; prototype meshes and the default scene |
+| `src/mesh_builder.h` / `.cpp` | Procedural shape generation |
 | `src/camera.h` / `.cpp` | Orbit camera; CPU rays and projection matching the shaders |
 | `src/gpu_types.h` | Host mirrors of the shader data layouts |
 | `src/config.h` | Window size, light, camera and quality constants |
@@ -167,7 +181,7 @@ The editor path is deliberately cheap. On any scene edit:
 
 1. The instance array (`VkAccelerationStructureInstanceKHR`, one per object)
    and the per-object shading SSBO are rewritten on the host (both persistently
-   mapped).
+   mapped) once the previous frame has finished (one frame in flight).
 2. The TLAS rebuild (`PREFER_FAST_BUILD`) is recorded at the start of that
    frame's command buffer, followed by a barrier to the ray tracing stage - no
    extra submit and no queue stall. With at most 64 instances it is

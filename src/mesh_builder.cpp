@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <numbers>
 #include <span>
 
@@ -79,20 +80,21 @@ void MeshBuilder::flatTriangle(const Vec3& a, const Vec3& b, const Vec3& c, cons
     triangle(i, i + 1, i + 2);
 }
 
-template <class PosFn>
-void MeshBuilder::grid(int segU, int segV, bool outward, PosFn pos) {
+template <class PosFn, class InteriorFn>
+void MeshBuilder::grid(int segU, int segV, PosFn pos, InteriorFn interior) {
     const auto base   = static_cast<uint32_t>(verts_.size());
     const auto stride = static_cast<uint32_t>(segV + 1);
 
     for (int i = 0; i <= segU; ++i) {
         for (int j = 0; j <= segV; ++j) {
-            const Vec3 p  = pos(i, j);
-            const Vec3 du = pos(i + 1, j) - pos(i - 1, j);
-            const Vec3 dv = pos(i, j + 1) - pos(i, j - 1);
+            const Vec3 p       = pos(i, j);
+            const Vec3 du      = pos(i + 1, j) - pos(i - 1, j);
+            const Vec3 dv      = pos(i, j + 1) - pos(i, j - 1);
+            const Vec3 outward = p - interior(i, j);
             Vec3 n = du.cross(dv);
             const float len = n.length();
-            n = (len > 1e-5f) ? n / len : p.normalize();   // radial fallback at degenerate poles
-            if (outward && n.dot(p) < 0.0f) n = -n;
+            n = (len > 1e-5f) ? n / len : outward.normalize();   // degenerate poles: radial
+            if (n.dot(outward) < 0.0f) n = -n;
             vertex(p, n);
         }
     }
@@ -241,23 +243,34 @@ void MeshBuilder::dodecahedron(float circumradius) {
 
 void MeshBuilder::supertoroid(int segU, int segV) {
     constexpr float exponent = 2.2f, twist = 3.0f, majorR = 2.2f;
-    grid(segU, segV, false, [&](int i, int j) {
-        const float u  = TWO_PI * static_cast<float>(wrap(i, segU)) / static_cast<float>(segU);
-        const float v  = TWO_PI * static_cast<float>(wrap(j, segV)) / static_cast<float>(segV);
-        const float cv = std::max(std::fabs(std::cos(v)), 1e-9f);
-        const float sv = std::max(std::fabs(std::sin(v)), 1e-9f);
-        const float rr = std::pow(std::pow(cv, exponent) + std::pow(sv, exponent), -1.0f / exponent);
-        const float phi = twist * u + v;
-        const float r   = majorR + rr * std::cos(phi);
-        return Vec3{ r * std::cos(u), rr * std::sin(phi), r * std::sin(u) };
-    });
+    // Both parameters go once around (u: the ring, v: the tube), so both wrap.
+    auto angle = [](int i, int n) { return TWO_PI * static_cast<float>(wrap(i, n)) / static_cast<float>(n); };
+    grid(segU, segV,
+        [&](int i, int j) {
+            const float u  = angle(i, segU);
+            const float v  = angle(j, segV);
+            const float cv = std::max(std::fabs(std::cos(v)), 1e-9f);
+            const float sv = std::max(std::fabs(std::sin(v)), 1e-9f);
+            const float rr = std::pow(std::pow(cv, exponent) + std::pow(sv, exponent), -1.0f / exponent);
+            const float phi = twist * u + v;
+            const float r   = majorR + rr * std::cos(phi);
+            return Vec3{ r * std::cos(u), rr * std::sin(phi), r * std::sin(u) };
+        },
+        // The tube's centre line: normals point out of the tube, not away
+        // from the ring's centre (which is outside the solid).
+        [&](int i, int) {
+            const float u = angle(i, segU);
+            return Vec3{ majorR * std::cos(u), 0.0f, majorR * std::sin(u) };
+        });
 }
 
 void MeshBuilder::supershape(int segU, int segV) {
     constexpr float m = 6, n1 = 5, n2 = 5, n3 = 5;
+    // Longitude goes once around and wraps; latitude runs from pole to pole,
+    // so it is clamped (one-sided differences at the poles) instead.
     auto raw = [&](int i, int j) {
         const float th = -PI + TWO_PI * static_cast<float>(wrap(i, segU)) / static_cast<float>(segU);
-        const float ph = -0.5f * PI + PI * static_cast<float>(wrap(j, segV)) / static_cast<float>(segV);
+        const float ph = -0.5f * PI + PI * static_cast<float>(std::clamp(j, 0, segV)) / static_cast<float>(segV);
         const float r1 = superformula(th, m, n1, n2, n3);
         const float r2 = superformula(ph, m, n1, n2, n3);
         return Vec3{ r1 * std::cos(th) * r2 * std::cos(ph),
@@ -271,7 +284,9 @@ void MeshBuilder::supershape(int segU, int segV) {
         for (int j = 0; j <= segV; ++j) maxR = std::max(maxR, raw(i, j).length());
 
     const float scale = 1.6f / maxR;
-    grid(segU, segV, true, [&](int i, int j) { return raw(i, j) * scale; });
+    grid(segU, segV,
+        [&](int i, int j) { return raw(i, j) * scale; },
+        [](int, int) { return Vec3{}; });   // star-shaped around the origin
 }
 
 void MeshBuilder::floor(float half) {

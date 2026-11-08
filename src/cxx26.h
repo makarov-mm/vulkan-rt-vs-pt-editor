@@ -27,43 +27,39 @@
 
 // P0843R14: std::inplace_vector -- fixed capacity, in-object storage and, what
 // Vulkan descriptor updates need, pointer stability: elements never relocate,
-// so the address of the last pushed element stays valid.
+// so the address of a pushed element stays valid.
 #if defined(__cpp_lib_inplace_vector) && __cpp_lib_inplace_vector >= 202406L
 #  include <inplace_vector>
 template <class T, std::size_t N>
 using FixedVector = std::inplace_vector<T, N>;
 #else
 // Minimal polyfill with the same stability guarantee, covering exactly the
-// subset this project uses. Retire it once the standard library ships P0843.
+// subset this project uses (it only ever holds plain Vulkan structs). Retire
+// it once the standard library ships P0843.
+#  include <array>
 #  include <cassert>
-#  include <memory>
-#  include <utility>
+#  include <type_traits>
 template <class T, std::size_t N>
+    requires std::is_trivially_copyable_v<T> && std::is_default_constructible_v<T>
 class FixedVector {
 public:
-    FixedVector() = default;
-    FixedVector(const FixedVector&)            = CXX26_DELETED("not needed by this project; the polyfill stays minimal");
-    FixedVector& operator=(const FixedVector&) = CXX26_DELETED("not needed by this project; the polyfill stays minimal");
-    ~FixedVector() { std::destroy_n(data(), count_); }
-
-    template <class... Args>
-    T& emplace_back(Args&&... args) {
+    constexpr T& push_back(const T& v) {
         assert(count_ < N && "FixedVector capacity exceeded");
-        T* p = std::construct_at(data() + count_, std::forward<Args>(args)...);
-        ++count_;
-        return *p;
+        return items_[count_++] = v;
     }
-    T& push_back(const T& v) { return emplace_back(v); }
 
-    [[nodiscard]] T&       back()       { assert(count_ > 0); return data()[count_ - 1]; }
-    [[nodiscard]] const T& back() const { assert(count_ > 0); return data()[count_ - 1]; }
+    [[nodiscard]] constexpr T*          data()        noexcept { return items_.data(); }
+    [[nodiscard]] constexpr const T*    data()  const noexcept { return items_.data(); }
+    [[nodiscard]] constexpr std::size_t size()  const noexcept { return count_; }
+    [[nodiscard]] constexpr bool        empty() const noexcept { return count_ == 0; }
 
-    [[nodiscard]] T*          data()       noexcept { return reinterpret_cast<T*>(storage_); }
-    [[nodiscard]] const T*    data() const noexcept { return reinterpret_cast<const T*>(storage_); }
-    [[nodiscard]] std::size_t size() const noexcept { return count_; }
+    [[nodiscard]] constexpr T*       begin()       noexcept { return items_.data(); }
+    [[nodiscard]] constexpr T*       end()         noexcept { return items_.data() + count_; }
+    [[nodiscard]] constexpr const T* begin() const noexcept { return items_.data(); }
+    [[nodiscard]] constexpr const T* end()   const noexcept { return items_.data() + count_; }
 
 private:
-    alignas(T) std::byte storage_[sizeof(T) * N];
-    std::size_t count_ = 0;
+    std::array<T, N> items_{};
+    std::size_t      count_ = 0;
 };
 #endif

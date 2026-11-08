@@ -9,11 +9,15 @@
 //  - Left half: Whitted ray tracing. Right half: Monte Carlo path tracing with
 //    an SVGF-style a-trous denoiser. Same scene, camera and TLAS.
 // -----------------------------------------------------------------------------
+#include "platform.h"
+
 #include <cstdio>
 #include <exception>
 #include <print>
+#include <string>
+#include <string_view>
 
-#include "platform.h"
+#include "config.h"
 #include "scene_editor.h"
 
 namespace {
@@ -23,22 +27,36 @@ class GdiplusSession {
 public:
     GdiplusSession() {
         const Gdiplus::GdiplusStartupInput input;
-        Gdiplus::GdiplusStartup(&token_, &input, nullptr);
+        started_ = Gdiplus::GdiplusStartup(&token_, &input, nullptr) == Gdiplus::Ok;   // else: GDI fallback icons
     }
-    ~GdiplusSession() { Gdiplus::GdiplusShutdown(token_); }
+    ~GdiplusSession() { if (started_) Gdiplus::GdiplusShutdown(token_); }
     GdiplusSession(const GdiplusSession&)            = delete;
     GdiplusSession& operator=(const GdiplusSession&) = delete;
 
 private:
-    ULONG_PTR token_ = 0;
+    ULONG_PTR token_   = 0;
+    bool      started_ = false;
 };
 
-// A console window so validation messages and stdout are visible.
+// Debug builds open a console for the validation output; release builds only
+// attach to the console they were started from, if any.
 void attachConsole() {
-    if (!AllocConsole()) return;
+    BOOL attached = FALSE;
+    if constexpr (ENABLE_VALIDATION) attached = AllocConsole();
+    else                             attached = AttachConsole(ATTACH_PARENT_PROCESS);
+    if (!attached) return;
+    SetConsoleOutputCP(CP_UTF8);
     FILE* f = nullptr;
     freopen_s(&f, "CONOUT$", "w", stdout);
     freopen_s(&f, "CONOUT$", "w", stderr);
+}
+
+// Exception messages are UTF-8 (/utf-8, file paths): MessageBoxW needs UTF-16.
+std::wstring widen(std::string_view utf8) {
+    const int n = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
+    std::wstring w(static_cast<std::size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), w.data(), n);
+    return w;
 }
 } // namespace
 
@@ -52,7 +70,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         return 0;
     } catch (const std::exception& e) {
         std::println(stderr, "FATAL: {}", e.what());
-        MessageBoxA(nullptr, e.what(), "Vulkan RT Scene Editor - Error", MB_OK | MB_ICONERROR);
+        MessageBoxW(nullptr, widen(e.what()).c_str(), L"Vulkan RT Scene Editor - Error", MB_OK | MB_ICONERROR);
         return 1;
     }
 }

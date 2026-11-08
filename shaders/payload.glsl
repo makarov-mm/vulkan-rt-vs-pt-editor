@@ -4,7 +4,7 @@
 #ifndef PAYLOAD_GLSL
 #define PAYLOAD_GLSL
 
-// Material ids (Material enum in src/scene_object.h).
+// Material ids (Material enum in src/scene.h).
 const int MAT_FLOOR    = 0;
 const int MAT_SOLID    = 1;
 const int MAT_GLASS    = 2;

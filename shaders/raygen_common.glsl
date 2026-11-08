@@ -10,14 +10,15 @@
 
 layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
 layout(binding = 1, set = 0, rgba8) uniform image2D outImage;
-layout(binding = 2, set = 0) uniform CameraProperties {   // UBO in src/gpu_types.h
+layout(binding = 2, set = 0) uniform FrameUniforms {   // FrameUniforms in src/gpu_types.h
     mat4  viewInverse;
     mat4  projInverse;
-    vec4  lightPos;   // xyz = position, w = radius (area light)
-    vec4  params;     // x = time, y = max path length, z = light emission, w = samples per frame
-    uvec4 frame;      // x = accumulated frame index (0 on camera move / scene edit), y = free-running
-    vec4  marquee;    // rubber-band rect in pixels (x0,y0,x1,y1); x1 < x0 disables
-} cam;
+    vec4  light;        // xyz = position, w = radius (spherical area light)
+    vec4  lightColor;   // rgb = tint, w = emitted radiance (HDR)
+    uvec4 frame;        // x = accumulated frame index (0 on camera move / scene edit), y = free-running,
+                        // z = samples per frame, w = max path length
+    vec4  marquee;      // rubber-band rect in pixels (x0,y0,x1,y1); x1 < x0 disables
+} ubo;
 layout(binding = 5, set = 0, rgba32f) uniform image2D accumImage;   // rgb = running mean, a = sample count
 layout(binding = 6, set = 0, rgba32f) uniform image2D histImage;    // xyz = previous primary hit, w = glass signature
 
@@ -27,9 +28,6 @@ layout(location = 1) rayPayloadEXT float      shadowed;
 const float PI     = 3.14159265358979;
 const float TWO_PI = 6.28318530717959;
 const float EPS    = 0.001;
-
-// Lamp colour: matches LIGHT_COLOR in src/config.h.
-const vec3 LIGHT_TINT = vec3(1.0, 0.95, 0.85);
 
 // Per-channel IOR for chromatic dispersion (exaggerated for visibility).
 const float IOR_R = 1.50, IOR_G = 1.52, IOR_B = 1.54;
@@ -59,19 +57,19 @@ uint pixelSeed(uint sampleIndex) {
 // ---------------------------------------------------------------------------
 //  Camera
 // ---------------------------------------------------------------------------
-vec3 cameraOrigin() { return (cam.viewInverse * vec4(0, 0, 0, 1)).xyz; }
+vec3 cameraOrigin() { return (ubo.viewInverse * vec4(0, 0, 0, 1)).xyz; }
 
 // Primary ray direction through `pixel` (in launch pixels, centre = +0.5).
 vec3 cameraDir(vec2 pixel) {
     vec2 d      = pixel / vec2(gl_LaunchSizeEXT.xy) * 2.0 - 1.0;
-    vec4 target = cam.projInverse * vec4(d.x, d.y, 1, 1);
-    return normalize((cam.viewInverse * vec4(normalize(target.xyz), 0)).xyz);
+    vec4 target = ubo.projInverse * vec4(d.x, d.y, 1, 1);
+    return normalize((ubo.viewInverse * vec4(normalize(target.xyz), 0)).xyz);
 }
 
 // Angular size of one pixel (radians), for the checker filter footprint.
 // abs() because the projection bakes in the Vulkan Y flip.
 float pixelSpread() {
-    return 2.0 * abs(cam.projInverse[1][1]) / float(gl_LaunchSizeEXT.y);
+    return 2.0 * abs(ubo.projInverse[1][1]) / float(gl_LaunchSizeEXT.y);
 }
 
 // ---------------------------------------------------------------------------
@@ -188,7 +186,7 @@ vec3 accumulate(ivec2 pix, vec3 color, vec3 curPos, float curSig) {
     vec4  prevHist = imageLoad(histImage, pix);
     float camDist  = distance(curPos, cameraOrigin());
     float moved    = distance(curPos, prevHist.xyz);
-    bool  reset    = (cam.frame.x == 0u)
+    bool  reset    = (ubo.frame.x == 0u)
                   || (moved > 0.0008 * camDist + 0.0012)
                   || (abs(curSig - prevHist.w) > 0.02);
 
@@ -217,10 +215,10 @@ vec3 renderSample(inout uint seed, int sampleIdx, int spp);
 // counter (frame.y), not the accumulation counter, so the noise keeps
 // changing while the camera moves.
 vec3 renderPixel() {
-    int  spp   = max(1, int(cam.params.w));
+    int  spp   = max(1, int(ubo.frame.z));
     vec3 color = vec3(0.0);
     for (int s = 0; s < spp; ++s) {
-        uint seed = pixelSeed(cam.frame.y * uint(spp) + uint(s));
+        uint seed = pixelSeed(ubo.frame.y * uint(spp) + uint(s));
         color += renderSample(seed, s, spp);
     }
     return color / float(spp);

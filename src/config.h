@@ -20,18 +20,20 @@ inline constexpr float Z_NEAR    = 0.1f;
 inline constexpr float Z_FAR     = 100.0f;
 
 // ---- Light: a visible emissive sphere, the key light of both renderers ------
+// Position, size, tint and emission reach the shaders through the frame UBO.
 inline constexpr Vec3  LIGHT_POS{ 4.0f, 7.0f, -2.0f };
-inline constexpr float LIGHT_RADIUS   = 1.2f;    // bigger = softer shadows
-inline constexpr Vec3  LIGHT_COLOR{ 1.0f, 0.95f, 0.85f };   // must match LIGHT_TINT in shaders/common.glsl
-inline constexpr float LIGHT_EMISSION = 45.0f;   // HDR radiance
+inline constexpr float LIGHT_RADIUS   = 1.2f;                  // bigger = softer shadows
+inline constexpr Vec3  LIGHT_COLOR{ 1.0f, 0.95f, 0.85f };      // warm tint
+inline constexpr float LIGHT_EMISSION = 45.0f;                 // HDR radiance
 
 // ---- Prototype meshes -------------------------------------------------------
 // The light is the sphere prototype scaled by LIGHT_RADIUS / SPHERE_RADIUS.
 inline constexpr float SPHERE_RADIUS = 1.3f;
 
 // ---- Renderer quality -------------------------------------------------------
-inline constexpr int SAMPLES_PER_FRAME = 24;   // multiple of 3 for even dispersion; lower on weaker GPUs
-inline constexpr int MAX_PATH_LENGTH   = 8;    // glass needs a few bounces
+inline constexpr uint32_t SAMPLES_PER_FRAME = 24;   // lower on weaker GPUs
+inline constexpr uint32_t MAX_PATH_LENGTH   = 8;    // glass needs a few bounces
+static_assert(SAMPLES_PER_FRAME % 3 == 0, "dispersion cycles the hero wavelength over R, G, B per sample");
 
 #ifdef NDEBUG
 inline constexpr bool ENABLE_VALIDATION = false;

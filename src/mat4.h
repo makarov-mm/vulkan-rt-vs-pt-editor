@@ -1,8 +1,6 @@
 #pragma once
 #include <array>
 
-#include "vec3.h"
-
 // Column-major 4x4 matrix, laid out exactly like a GLSL mat4 (16 floats).
 struct Mat4 {
     std::array<float, 16> m{};

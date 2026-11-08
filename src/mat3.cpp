@@ -1,5 +1,7 @@
 #include "mat3.h"
 
+#include <cmath>
+
 Mat3 Mat3::rotation(const Vec3& axis, float angle) noexcept {
     const Vec3  a = axis.normalize();
     const float c = std::cos(angle);

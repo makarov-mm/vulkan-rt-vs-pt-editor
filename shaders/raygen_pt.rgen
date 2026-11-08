@@ -32,9 +32,9 @@ vec3 sampleCosineHemisphere(vec3 n, inout uint seed) {
 
 // Solid-angle pdf of sampling the spherical light from p (0 inside / touching it).
 float lightSolidAnglePdf(vec3 p) {
-    vec3  toL = cam.lightPos.xyz - p;
+    vec3  toL = ubo.light.xyz - p;
     float d2  = dot(toL, toL);
-    float r   = cam.lightPos.w;
+    float r   = ubo.light.w;
     if (d2 <= r * r * 1.0201) return 0.0;   // (1.01 r)^2, same threshold as NEE below
     float sinMax = clamp(r / sqrt(d2), 0.0, 0.999);
     float cosMax = sqrt(1.0 - sinMax * sinMax);
@@ -50,9 +50,9 @@ float powerHeuristic(float a, float b) {
 // Next event estimation at the current payload hit, MIS-weighted against the
 // cosine BSDF pdf. P = offset hit point.
 vec3 sampleDirectLight(vec3 N, vec3 P, vec3 albedo, inout uint seed) {
-    vec3  toLight = cam.lightPos.xyz - payload.hitPos;
+    vec3  toLight = ubo.light.xyz - payload.hitPos;
     float dist    = length(toLight);
-    float radius  = cam.lightPos.w;
+    float radius  = ubo.light.w;
     if (dist <= radius * 1.01) return vec3(0.0);
 
     float sinMax = clamp(radius / dist, 0.0, 0.999);
@@ -64,7 +64,7 @@ vec3 sampleDirectLight(vec3 N, vec3 P, vec3 albedo, inout uint seed) {
     if (cosNL <= 0.0 || traceShadow(P, Ls, dist - radius * 1.001) >= 0.5) return vec3(0.0);
 
     // Le * f_d * cos / pdf, weighted against the BSDF pdf of the same direction.
-    vec3  Le = LIGHT_TINT * cam.params.z;
+    vec3  Le = ubo.lightColor.rgb * ubo.lightColor.w;
     float w  = powerHeuristic(pdfL, cosNL / PI);
     return (albedo / PI) * Le * cosNL / pdfL * w;
 }
@@ -74,8 +74,8 @@ vec3 renderSample(inout uint seed, int sampleIdx, int spp) {
     vec3 origin = cameraOrigin();
     vec3 dir    = cameraDir(vec2(gl_LaunchIDEXT.xy) + 0.5 + jitter);
 
-    int   maxBounces = int(cam.params.y);
-    float emission   = cam.params.z;
+    int   maxBounces = int(ubo.frame.w);
+    float emission   = ubo.lightColor.w;
 
     vec3 color      = vec3(0.0);
     vec3 throughput = vec3(1.0);
@@ -222,5 +222,5 @@ void main() {
     // HDR accumulation -> display. With the denoiser on, the compute pass
     // overwrites this with the filtered result (same display transform).
     vec3 accum = accumulate(pix, color, curPos, curSig);
-    imageStore(outImage, pix, vec4(applyMarquee(toDisplay(accum), vec2(pix), cam.marquee), 1.0));
+    imageStore(outImage, pix, vec4(applyMarquee(toDisplay(accum), vec2(pix), ubo.marquee), 1.0));
 }

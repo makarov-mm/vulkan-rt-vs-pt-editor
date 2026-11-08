@@ -50,8 +50,10 @@ private:
 
     // (segU+1) x (segV+1) vertex grid for parametric surfaces. `pos(i, j)` must
     // accept indices one past either end (central-difference normals).
-    template <class PosFn>
-    void grid(int segU, int segV, bool outward, PosFn pos);
+    // Normals point away from `interior(i, j)`, a point inside the solid
+    // near pos(i, j): the shaders tell entering from leaving glass by them.
+    template <class PosFn, class InteriorFn>
+    void grid(int segU, int segV, PosFn pos, InteriorFn interior);
 
     std::vector<Vertex>   verts_;
     std::vector<uint32_t> indices_;

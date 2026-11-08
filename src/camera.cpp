@@ -1,6 +1,7 @@
 #include "camera.h"
 
 #include <algorithm>
+#include <cmath>
 #include <numbers>
 
 #include "config.h"

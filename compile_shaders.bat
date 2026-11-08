@@ -15,7 +15,7 @@ if not exist %GLSLANG% (
 echo Compiling shaders with %GLSLANG%
 
 for %%S in (raygen_rt.rgen raygen_pt.rgen miss.rmiss shadow.rmiss closesthit.rchit atrous.comp) do (
-    %GLSLANG% --target-env vulkan1.2 -V "%%S" -o "%%S.spv"
+    %GLSLANG% --target-env vulkan1.3 -V "%%S" -o "%%S.spv"
     if errorlevel 1 (
         echo ERROR compiling %%S
         exit /b 1
